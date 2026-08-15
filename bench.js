@@ -111,7 +111,7 @@ async function run() {
     const buf = frame(SEQUENCER_HOST, "/", SEND_BODY);
     const warm = [], disp = [];
     let reply = "";
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 500; i++) {
       const s = performance.now();
       const p = hs.fire(buf);
       disp.push(performance.now() - s);
@@ -120,8 +120,9 @@ async function run() {
       if (i === 0) reply = (r.body || "").slice(0, 60).replace(/\s+/g, " ");
     }
     warm.shift(); disp.shift();
-    out(`  ${ip.padEnd(16)} handshake ${f(hand)}ms | send min ${f(Math.min(...warm))}ms p50 ${f(pct(warm,0.5))}ms p99 ${f(pct(warm,0.99))}ms`);
-    out(`  ${" ".repeat(16)} dispatch p50 ${pct(disp,0.5).toFixed(3)}ms max ${Math.max(...disp).toFixed(3)}ms`);
+    out(`  ${ip.padEnd(16)} handshake ${f(hand)}ms | send min ${f(Math.min(...warm))}ms p50 ${f(pct(warm,0.5))}ms p90 ${f(pct(warm,0.90))}ms p99 ${f(pct(warm,0.99))}ms max ${f(Math.max(...warm))}ms  (n=${warm.length})`);
+    out(`  ${" ".repeat(16)} dispatch p50 ${pct(disp,0.5).toFixed(3)}ms p99 ${pct(disp,0.99).toFixed(3)}ms max ${Math.max(...disp).toFixed(3)}ms`);
+    out(`  ${" ".repeat(16)} over 5ms: ${warm.filter(x=>x>5).length}/${warm.length} | over 10ms: ${warm.filter(x=>x>10).length}/${warm.length}`);
     out(`  ${" ".repeat(16)} reply: ${reply}`);
     hs.destroy();
   }
