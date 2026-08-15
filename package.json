@@ -1,0 +1,6 @@
+{
+  "name": "rh-latency",
+  "type": "module",
+  "private": true,
+  "scripts": { "start": "node bench.js" }
+}
