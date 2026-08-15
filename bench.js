@@ -1,264 +1,124 @@
-// Robinhood Chain latency harness — raw persistent TLS sockets vs ordinary
-// https.request, measured against every sequencer load-balancer IP.
-// Networking layer only; no keys, no strategy. Private endpoints via EXTRA_RPCS.
+// Decompose the send latency to the Robinhood Chain sequencer:
+//   pure TCP RTT  vs  TLS handshake  vs  full request round trip
+// so we know whether the remaining milliseconds are network distance
+// (fixable only by moving the box) or protocol/server overhead.
 import net from "node:net";
 import tls from "node:tls";
 import dns from "node:dns/promises";
-import https from "node:https";
 import http from "node:http";
+import os from "node:os";
 import { performance } from "node:perf_hooks";
 
-const SEQUENCER_HOST = "sequencer.mainnet.chain.robinhood.com";
-const PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
-const EXTRA = (process.env.EXTRA_RPCS || "").split(",").map((s) => s.trim()).filter(Boolean);
+const HOST = "sequencer.mainnet.chain.robinhood.com";
+const SEND_BODY = JSON.stringify({ jsonrpc: "2.0", method: "eth_sendRawTransaction", params: ["0x02"], id: 1 });
 
-const jsonBody = (method, params = []) => JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 });
-const SEND_BODY = jsonBody("eth_sendRawTransaction", ["0x02"]); // parsed then rejected — nothing broadcast
+const pct = (a, p) => [...a].sort((x, y) => x - y)[Math.floor(a.length * p)];
+const f = (n) => (Number.isFinite(n) ? n.toFixed(3) : "n/a").padStart(7);
 
-function frame(host, path, body) {
+function frame(host, body) {
   return Buffer.from(
-    `POST ${path} HTTP/1.1\r\nHost: ${host}\r\nContent-Type: application/json\r\n` +
+    `POST / HTTP/1.1\r\nHost: ${host}\r\nContent-Type: application/json\r\n` +
     `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`
   );
 }
 
-const CRLF2 = Buffer.from("\r\n\r\n");
-const CONTENT_LENGTH = Buffer.from("content-length:");
-function findHeader(buf, name, limit) {
-  const n = name.length;
-  outer: for (let i = 0; i <= limit - n; i++) {
-    for (let j = 0; j < n; j++) if ((buf[i + j] | 0x20) !== name[j]) continue outer;
-    return i + n;
-  }
-  return -1;
+// One TCP handshake = exactly one network round trip. This is the physical floor.
+function tcpRtt(ip, port = 443) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const s = net.connect({ host: ip, port });
+    s.once("connect", () => { const ms = performance.now() - t0; s.destroy(); resolve(ms); });
+    s.once("error", () => resolve(NaN));
+    s.setTimeout(5000, () => { s.destroy(); resolve(NaN); });
+  });
 }
 
-class HotSocket {
-  constructor({ label, host, port = 443, path = "/", ip = null }) {
-    Object.assign(this, { label, host, port, path, ip });
-    this.sock = null; this.queue = []; this.buf = Buffer.alloc(0);
-  }
-  connect() {
-    return new Promise((resolve) => {
-      this.sock = tls.connect({
-        host: this.ip || this.host, servername: this.host, port: this.port,
-        ALPNProtocols: ["http/1.1"],
-      });
-      this.sock.once("secureConnect", () => {
-        this.sock.setNoDelay(true);
-        this.sock.on("data", (c) => this._onData(c));
-        this.sock.on("error", () => this._drop());
-        this.sock.on("close", () => this._drop());
-        resolve(true);
-      });
-      this.sock.once("error", () => resolve(false));
-      this.sock.setTimeout(15000, () => this.sock.destroy());
+function tlsHandshake(ip, host) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const s = tls.connect({ host: ip, servername: host, port: 443, ALPNProtocols: ["http/1.1"] });
+    s.once("secureConnect", () => {
+      const info = { ms: performance.now() - t0, proto: s.getProtocol(), alpn: s.alpnProtocol, cipher: s.getCipher()?.name };
+      s.destroy();
+      resolve(info);
     });
-  }
-  _drop() { for (const r of this.queue.splice(0)) r({ ok: false }); this.sock = null; }
-  _onData(chunk) {
-    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
-    for (;;) {
-      const headEnd = this.buf.indexOf(CRLF2);
-      if (headEnd === -1) return;
-      const clAt = findHeader(this.buf, CONTENT_LENGTH, headEnd);
-      if (clAt === -1) return;
-      let len = 0;
-      for (let p = clAt; p < headEnd; p++) {
-        const c = this.buf[p];
-        if (c === 0x20) continue;
-        if (c < 0x30 || c > 0x39) break;
-        len = len * 10 + (c - 0x30);
-      }
-      const start = headEnd + 4;
-      if (this.buf.length < start + len) return;
-      const body = this.buf.toString("latin1", start, start + len);
-      this.buf = this.buf.subarray(start + len);
-      const r = this.queue.shift();
-      if (r) r({ ok: true, body });
-    }
-  }
-  fire(buffer) {
-    if (!this.sock || this.sock.destroyed) return Promise.resolve({ ok: false });
-    const p = new Promise((res) => this.queue.push(res));
-    this.sock.write(buffer);
-    return p;
-  }
-  fireMany(buffer, count) {
-    if (!this.sock || this.sock.destroyed) return Promise.resolve([]);
-    const ps = new Array(count);
-    for (let i = 0; i < count; i++) ps[i] = new Promise((res) => this.queue.push(res));
-    this.sock.write(buffer);
-    return Promise.all(ps);
-  }
-  destroy() { this.sock?.destroy(); }
+    s.once("error", () => resolve({ ms: NaN }));
+    s.setTimeout(8000, () => { s.destroy(); resolve({ ms: NaN }); });
+  });
 }
 
-const pct = (a, p) => [...a].sort((x, y) => x - y)[Math.floor(a.length * p)];
-const f = (n) => n.toFixed(2).padStart(7);
+function openHot(ip, host) {
+  return new Promise((resolve) => {
+    const s = tls.connect({ host: ip, servername: host, port: 443, ALPNProtocols: ["http/1.1"] });
+    s.once("secureConnect", () => { s.setNoDelay(true); resolve(s); });
+    s.once("error", () => resolve(null));
+    s.setTimeout(8000, () => { s.destroy(); resolve(null); });
+  });
+}
+
+function roundTrip(sock, buf) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    sock.once("data", () => resolve(performance.now() - t0));
+    sock.write(buf);
+  });
+}
 
 async function run() {
   const L = [];
   const out = (s) => { console.log(s); L.push(s); };
+  out(`===== Latency decomposition @ ${new Date().toISOString()} =====`);
+  out(`host ${os.hostname()} | ${os.cpus().length} cpu | ${os.platform()} ${os.release()}\n`);
 
-  out(`===== Robinhood Chain — Ohio box @ ${new Date().toISOString()} =====\n`);
-
-  // ── 1. Raw persistent TLS socket to every sequencer LB IP ──
   let ips = [];
-  try { ips = await dns.resolve4(SEQUENCER_HOST); } catch {}
-  out(`sequencer DNS → ${ips.join(", ") || "resolution failed"}\n`);
-  out(`--- RAW PERSISTENT TLS SOCKET (the bot's fire path) ---`);
+  try { ips = await dns.resolve4(HOST); } catch {}
+  out(`sequencer IPs: ${ips.join(", ")}\n`);
+
+  const buf = frame(HOST, SEND_BODY);
 
   for (const ip of ips) {
-    const hs = new HotSocket({ label: ip, host: SEQUENCER_HOST, ip });
-    const t0 = performance.now();
-    const ok = await hs.connect();
-    const hand = performance.now() - t0;
-    if (!ok) { out(`  ${ip.padEnd(16)} CONNECT FAILED`); continue; }
-    const buf = frame(SEQUENCER_HOST, "/", SEND_BODY);
-    const warm = [], disp = [];
-    let reply = "";
-    for (let i = 0; i < 500; i++) {
-      const s = performance.now();
-      const p = hs.fire(buf);
-      disp.push(performance.now() - s);
-      const r = await p;
-      warm.push(performance.now() - s);
-      if (i === 0) reply = (r.body || "").slice(0, 60).replace(/\s+/g, " ");
-    }
-    warm.shift(); disp.shift();
-    out(`  ${ip.padEnd(16)} handshake ${f(hand)}ms | send min ${f(Math.min(...warm))}ms p50 ${f(pct(warm,0.5))}ms p90 ${f(pct(warm,0.90))}ms p99 ${f(pct(warm,0.99))}ms max ${f(Math.max(...warm))}ms  (n=${warm.length})`);
-    out(`  ${" ".repeat(16)} dispatch p50 ${pct(disp,0.5).toFixed(3)}ms p99 ${pct(disp,0.99).toFixed(3)}ms max ${Math.max(...disp).toFixed(3)}ms`);
-    out(`  ${" ".repeat(16)} over 5ms: ${warm.filter(x=>x>5).length}/${warm.length} | over 10ms: ${warm.filter(x=>x>10).length}/${warm.length}`);
-    out(`  ${" ".repeat(16)} reply: ${reply}`);
-    hs.destroy();
+    out(`── ${ip} ──`);
+
+    const tcp = [];
+    for (let i = 0; i < 25; i++) { const v = await tcpRtt(ip); if (Number.isFinite(v)) tcp.push(v); }
+    if (tcp.length === 0) { out("   TCP unreachable\n"); continue; }
+    const tcpMin = Math.min(...tcp), tcpP50 = pct(tcp, 0.5);
+    out(`   TCP handshake (1 RTT)  min ${f(tcpMin)}ms  p50 ${f(tcpP50)}ms  p90 ${f(pct(tcp,0.9))}ms`);
+
+    const h = await tlsHandshake(ip, HOST);
+    out(`   TLS handshake          ${f(h.ms)}ms  (${h.proto || "?"}, alpn=${h.alpn || "none"}, ${h.cipher || "?"})`);
+
+    const sock = await openHot(ip, HOST);
+    if (!sock) { out(`   hot socket failed\n`); continue; }
+    await roundTrip(sock, buf);
+    const rt = [];
+    for (let i = 0; i < 200; i++) rt.push(await roundTrip(sock, buf));
+    const rtMin = Math.min(...rt), rtP50 = pct(rt, 0.5);
+    out(`   Warm request           min ${f(rtMin)}ms  p50 ${f(rtP50)}ms  p90 ${f(pct(rt,0.9))}ms  p99 ${f(pct(rt,0.99))}ms`);
+    out(`   → server+TLS cost      min ${f(rtMin - tcpMin)}ms  p50 ${f(rtP50 - tcpP50)}ms`);
+    out(`   → network share        ${((tcpMin / rtMin) * 100).toFixed(0)}% of the min round trip`);
+    sock.destroy();
+    out("");
   }
 
-  // ── 1b. PIPELINING: N requests in ONE write vs N separate writes ──
-  out(`\n--- PIPELINED SALVO (simulating N wallets firing at once) ---`);
-  if (ips.length) {
-    const hs = new HotSocket({ label: "pipe", host: SEQUENCER_HOST, ip: ips[0] });
-    if (await hs.connect()) {
-      const one = frame(SEQUENCER_HOST, "/", SEND_BODY);
-      for (const N of [1, 3, 5, 10]) {
-        const salvo = Buffer.concat(Array(N).fill(one));
-        // (a) pipelined: single write
-        const pipeT = [];
-        let good = 0;
-        for (let i = 0; i < 40; i++) {
-          const s = performance.now();
-          const rs = await hs.fireMany(salvo, N);
-          pipeT.push(performance.now() - s);
-          if (rs.length === N && rs.every((r) => r.ok && r.body.includes("jsonrpc"))) good++;
-        }
-        // (b) sequential writes, all in flight before awaiting
-        const seqT = [];
-        for (let i = 0; i < 40; i++) {
-          const s = performance.now();
-          const ps = [];
-          for (let k = 0; k < N; k++) ps.push(hs.fire(one));
-          const dispatched = performance.now() - s;
-          await Promise.all(ps);
-          seqT.push(dispatched);
-        }
-        out(`  N=${String(N).padStart(2)}  pipelined: ${good}/40 fully answered | last-byte-out p50 ${f(pct(pipeT,0.5))}ms`);
-        out(`        separate writes dispatch p50 ${f(pct(seqT,0.5))}ms  (delay imposed on the LAST wallet)`);
-      }
-      hs.destroy();
-    }
+  out(`── protocol probes ──`);
+  for (const port of [80, 8545, 8547]) {
+    const v = await tcpRtt(ips[0], port);
+    out(`   port ${String(port).padEnd(5)} ${Number.isFinite(v) ? `OPEN (TCP ${f(v)}ms)` : "closed/filtered"}`);
   }
+  const h2 = await new Promise((resolve) => {
+    const s = tls.connect({ host: ips[0], servername: HOST, port: 443, ALPNProtocols: ["h2", "http/1.1"] });
+    s.once("secureConnect", () => { const a = s.alpnProtocol; s.destroy(); resolve(a); });
+    s.once("error", () => resolve("error"));
+    s.setTimeout(8000, () => { s.destroy(); resolve("timeout"); });
+  });
+  out(`   ALPN h2 offered → server chose: ${h2}${h2 === "h2" ? "  (HTTP/2: parallel streams on ONE socket)" : "  (HTTP/1.1 only: parallel sockets required)"}`);
 
-  // ── 1c. DECISIVE: N wallets on ONE socket (pipelined) vs N PARALLEL sockets ──
-  // HTTP/1.1 responses must return in order, so a single connection may force
-  // the server to handle requests one at a time. If so, each wallet needs its
-  // own socket.
-  out(`\n--- ONE SOCKET (pipelined) vs N PARALLEL SOCKETS ---`);
-  if (ips.length) {
-    const one = frame(SEQUENCER_HOST, "/", SEND_BODY);
-    for (const N of [3, 5]) {
-      // (a) one socket, N pipelined requests
-      const solo = new HotSocket({ label: "solo", host: SEQUENCER_HOST, ip: ips[0] });
-      await solo.connect();
-      const salvo = Buffer.concat(Array(N).fill(one));
-      await solo.fireMany(salvo, N);
-      const pipeT = [];
-      for (let i = 0; i < 30; i++) {
-        const s = performance.now();
-        await solo.fireMany(salvo, N);
-        pipeT.push(performance.now() - s);
-      }
-      solo.destroy();
-
-      // (b) N sockets, one request each, fired together
-      const pool = [];
-      for (let k = 0; k < N; k++) {
-        const h = new HotSocket({ label: `p${k}`, host: SEQUENCER_HOST, ip: ips[k % ips.length] });
-        if (await h.connect()) { await h.fire(one); pool.push(h); }
-      }
-      const parT = [];
-      for (let i = 0; i < 30; i++) {
-        const s = performance.now();
-        await Promise.all(pool.map((h) => h.fire(one)));
-        parT.push(performance.now() - s);
-      }
-      pool.forEach((h) => h.destroy());
-
-      out(`  N=${N}  one socket pipelined: all-answered p50 ${f(pct(pipeT,0.5))}ms`);
-      out(`       ${N} parallel sockets  : all-answered p50 ${f(pct(parT,0.5))}ms  <-- ${pct(parT,0.5) < pct(pipeT,0.5) ? "PARALLEL WINS" : "pipelining fine"}`);
-    }
-  }
-
-  // ── 2. Same thing through ordinary https.request, for comparison ──
-  out(`\n--- ORDINARY https.request + keep-alive agent (for comparison) ---`);
-  for (const url of [`https://${SEQUENCER_HOST}`, PUBLIC_RPC, ...EXTRA]) {
-    const u = new URL(url);
-    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
-    const once = (body) => new Promise((res, rej) => {
-      const req = https.request({ agent, host: u.hostname, path: u.pathname + u.search, method: "POST",
-        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } },
-        (r) => { const c = []; r.on("data", (d) => c.push(d)); r.on("end", () => res(Buffer.concat(c).toString())); });
-      req.setTimeout(15000, () => req.destroy(new Error("timeout")));
-      req.on("error", rej); req.end(body);
-    });
-    try {
-      await once(SEND_BODY);
-      const t = [];
-      for (let i = 0; i < 15; i++) { const s = performance.now(); await once(SEND_BODY); t.push(performance.now() - s); }
-      out(`  ${u.hostname.padEnd(38)} send min ${f(Math.min(...t))}ms p50 ${f(pct(t,0.5))}ms`);
-    } catch (e) {
-      out(`  ${u.hostname.padEnd(38)} FAILED ${e.message}`);
-    } finally { agent.destroy(); }
-  }
-
-  // ── 3. Read endpoints ──
-  out(`\n--- READ path (eth_blockNumber) ---`);
-  for (const url of [PUBLIC_RPC, ...EXTRA]) {
-    const u = new URL(url);
-    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
-    const body = jsonBody("eth_blockNumber");
-    const once = () => new Promise((res, rej) => {
-      const req = https.request({ agent, host: u.hostname, path: u.pathname + u.search, method: "POST",
-        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } },
-        (r) => { const c = []; r.on("data", (d) => c.push(d)); r.on("end", () => res(Buffer.concat(c).toString())); });
-      req.setTimeout(15000, () => req.destroy(new Error("timeout")));
-      req.on("error", rej); req.end(body);
-    });
-    try {
-      await once();
-      const t = [];
-      for (let i = 0; i < 15; i++) { const s = performance.now(); await once(); t.push(performance.now() - s); }
-      out(`  ${u.hostname.padEnd(38)} read min ${f(Math.min(...t))}ms p50 ${f(pct(t,0.5))}ms p99 ${f(pct(t,0.99))}ms`);
-    } catch (e) {
-      out(`  ${u.hostname.padEnd(38)} FAILED ${e.message}`);
-    } finally { agent.destroy(); }
-  }
-
-  out(`\ndispatch p50 = pure software cost. send p50 = what a mint tx actually pays.`);
+  out(`\nIf network share is ~90%+, only moving the box closer helps.`);
   return L.join("\n");
 }
 
 let report = "running...";
 run().then((r) => { report = r; }).catch((e) => { report = "error: " + (e.stack || e.message); });
-
 http.createServer((_q, s) => { s.writeHead(200, { "content-type": "text/plain" }); s.end(report); })
   .listen(process.env.PORT || 10000);
