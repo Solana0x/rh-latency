@@ -168,6 +168,46 @@ async function run() {
     }
   }
 
+  // ── 1c. DECISIVE: N wallets on ONE socket (pipelined) vs N PARALLEL sockets ──
+  // HTTP/1.1 responses must return in order, so a single connection may force
+  // the server to handle requests one at a time. If so, each wallet needs its
+  // own socket.
+  out(`\n--- ONE SOCKET (pipelined) vs N PARALLEL SOCKETS ---`);
+  if (ips.length) {
+    const one = frame(SEQUENCER_HOST, "/", SEND_BODY);
+    for (const N of [3, 5]) {
+      // (a) one socket, N pipelined requests
+      const solo = new HotSocket({ label: "solo", host: SEQUENCER_HOST, ip: ips[0] });
+      await solo.connect();
+      const salvo = Buffer.concat(Array(N).fill(one));
+      await solo.fireMany(salvo, N);
+      const pipeT = [];
+      for (let i = 0; i < 30; i++) {
+        const s = performance.now();
+        await solo.fireMany(salvo, N);
+        pipeT.push(performance.now() - s);
+      }
+      solo.destroy();
+
+      // (b) N sockets, one request each, fired together
+      const pool = [];
+      for (let k = 0; k < N; k++) {
+        const h = new HotSocket({ label: `p${k}`, host: SEQUENCER_HOST, ip: ips[k % ips.length] });
+        if (await h.connect()) { await h.fire(one); pool.push(h); }
+      }
+      const parT = [];
+      for (let i = 0; i < 30; i++) {
+        const s = performance.now();
+        await Promise.all(pool.map((h) => h.fire(one)));
+        parT.push(performance.now() - s);
+      }
+      pool.forEach((h) => h.destroy());
+
+      out(`  N=${N}  one socket pipelined: all-answered p50 ${f(pct(pipeT,0.5))}ms`);
+      out(`       ${N} parallel sockets  : all-answered p50 ${f(pct(parT,0.5))}ms  <-- ${pct(parT,0.5) < pct(pipeT,0.5) ? "PARALLEL WINS" : "pipelining fine"}`);
+    }
+  }
+
   // ── 2. Same thing through ordinary https.request, for comparison ──
   out(`\n--- ORDINARY https.request + keep-alive agent (for comparison) ---`);
   for (const url of [`https://${SEQUENCER_HOST}`, PUBLIC_RPC, ...EXTRA]) {
