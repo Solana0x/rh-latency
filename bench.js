@@ -84,6 +84,13 @@ class HotSocket {
     this.sock.write(buffer);
     return p;
   }
+  fireMany(buffer, count) {
+    if (!this.sock || this.sock.destroyed) return Promise.resolve([]);
+    const ps = new Array(count);
+    for (let i = 0; i < count; i++) ps[i] = new Promise((res) => this.queue.push(res));
+    this.sock.write(buffer);
+    return Promise.all(ps);
+  }
   destroy() { this.sock?.destroy(); }
 }
 
@@ -125,6 +132,40 @@ async function run() {
     out(`  ${" ".repeat(16)} over 5ms: ${warm.filter(x=>x>5).length}/${warm.length} | over 10ms: ${warm.filter(x=>x>10).length}/${warm.length}`);
     out(`  ${" ".repeat(16)} reply: ${reply}`);
     hs.destroy();
+  }
+
+  // ── 1b. PIPELINING: N requests in ONE write vs N separate writes ──
+  out(`\n--- PIPELINED SALVO (simulating N wallets firing at once) ---`);
+  if (ips.length) {
+    const hs = new HotSocket({ label: "pipe", host: SEQUENCER_HOST, ip: ips[0] });
+    if (await hs.connect()) {
+      const one = frame(SEQUENCER_HOST, "/", SEND_BODY);
+      for (const N of [1, 3, 5, 10]) {
+        const salvo = Buffer.concat(Array(N).fill(one));
+        // (a) pipelined: single write
+        const pipeT = [];
+        let good = 0;
+        for (let i = 0; i < 40; i++) {
+          const s = performance.now();
+          const rs = await hs.fireMany(salvo, N);
+          pipeT.push(performance.now() - s);
+          if (rs.length === N && rs.every((r) => r.ok && r.body.includes("jsonrpc"))) good++;
+        }
+        // (b) sequential writes, all in flight before awaiting
+        const seqT = [];
+        for (let i = 0; i < 40; i++) {
+          const s = performance.now();
+          const ps = [];
+          for (let k = 0; k < N; k++) ps.push(hs.fire(one));
+          const dispatched = performance.now() - s;
+          await Promise.all(ps);
+          seqT.push(dispatched);
+        }
+        out(`  N=${String(N).padStart(2)}  pipelined: ${good}/40 fully answered | last-byte-out p50 ${f(pct(pipeT,0.5))}ms`);
+        out(`        separate writes dispatch p50 ${f(pct(seqT,0.5))}ms  (delay imposed on the LAST wallet)`);
+      }
+      hs.destroy();
+    }
   }
 
   // ── 2. Same thing through ordinary https.request, for comparison ──
